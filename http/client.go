@@ -3,9 +3,7 @@ package http
 import (
 	"bufio"
 	"errors"
-	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -17,6 +15,8 @@ var (
 	ErrClosed = &http.ProtocolError{ErrorString: "connection closed by user"}
 
 	ErrPipeline = &http.ProtocolError{ErrorString: "pipeline error"}
+
+	ErrBodyWaitingRead = &http.ProtocolError{ErrorString: "body data waiting for read"}
 )
 
 var errClosed = errors.New("i/o operation on closed connection")
@@ -25,6 +25,7 @@ type ClientConn struct {
 	mu              sync.Mutex // read-write protects the following fields
 	c               net.Conn
 	r               *bufio.Reader
+	bodyReading     bool
 	re, we          error // read/write errors
 	nread, nwritten int
 	reqch           chan *http.Request
@@ -54,19 +55,26 @@ func NewProxyClientConn(c net.Conn, r *bufio.Reader) *ClientConn {
 }
 
 func (cc *ClientConn) Do(req *http.Request) (*http.Response, error) {
-	err := cc.Write(req)
+	err := cc.write(req)
 	if err != nil {
 		return nil, err
 	}
-	return cc.Read(req)
+	return cc.read(req)
 }
 
-func (cc *ClientConn) Write(req *http.Request) error {
+func (cc *ClientConn) waitForBody() bool {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.bodyReading
+}
+func (cc *ClientConn) write(req *http.Request) error {
 	var err error
 	if err = cc.Ping(); err != nil {
 		return err
 	}
-	log.Println("write ping", err)
+	if cc.waitForBody() {
+		return ErrBodyWaitingRead
+	}
 	cc.mu.Lock()
 	c := cc.c
 	if req.Close {
@@ -86,7 +94,7 @@ func (cc *ClientConn) Write(req *http.Request) error {
 	return nil
 }
 
-func (cc *ClientConn) Read(req *http.Request) (resp *http.Response, err error) {
+func (cc *ClientConn) read(req *http.Request) (resp *http.Response, err error) {
 	resp = <-cc.respch
 	return
 }
@@ -135,7 +143,9 @@ func (cc *ClientConn) readLoop() {
 		rc := <-cc.reqch
 		resp, err := http.ReadResponse(cc.r, rc)
 		if err != nil {
+			cc.mu.Lock()
 			cc.re = err
+			cc.mu.Unlock()
 			break
 		}
 		hasBody := rc.Method != "HEAD" && resp.ContentLength != 0
@@ -159,14 +169,17 @@ func (cc *ClientConn) readLoop() {
 				return err
 			},
 		}
-		fmt.Println("has body", hasBody)
 		resp.Body = body
 		cc.respch <- resp
-		fmt.Println("wait for body read")
+		cc.mu.Lock()
+		cc.bodyReading = true
+		cc.mu.Unlock()
 		select {
 		case bodyEOF := <-waitForBodyRead:
-			fmt.Println(bodyEOF)
-			break
+			_ = bodyEOF
 		}
+		cc.mu.Lock()
+		cc.bodyReading = false
+		cc.mu.Unlock()
 	}
 }
