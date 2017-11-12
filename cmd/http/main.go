@@ -7,9 +7,8 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"time"
 
-	clientHTTP "github.com/zhaojkun/client/http"
+	"github.com/zhaojkun/client/httpclientutil"
 )
 
 func main() {
@@ -17,7 +16,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	c := clientHTTP.NewClientConn(conn, nil)
+	c := httpclientutil.NewClientConn(conn, nil)
 	req, _ := http.NewRequest("GET", "/", nil)
 	log.Println("time to write 1", c.Ping())
 	resp, err := c.Do(req)
@@ -30,5 +29,5 @@ func main() {
 	resp, err = c.Do(req)
 	fmt.Println(resp, err)
 	io.Copy(os.Stdout, resp.Body)
-	time.Sleep(time.Minute)
+	fmt.Println("bye")
 }

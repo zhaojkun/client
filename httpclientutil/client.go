@@ -1,4 +1,4 @@
-package http
+package httpclientutil
 
 import (
 	"bufio"
@@ -10,27 +10,26 @@ import (
 )
 
 var (
-	ErrPersistEOF = &http.ProtocolError{ErrorString: "persistent connection closed"}
-
-	ErrClosed = &http.ProtocolError{ErrorString: "connection closed by user"}
-
-	ErrPipeline = &http.ProtocolError{ErrorString: "pipeline error"}
-
-	ErrBodyWaitingRead = &http.ProtocolError{ErrorString: "body data waiting for read"}
+	ErrPersistEOF       = &http.ProtocolError{ErrorString: "persistent connection closed"}
+	ErrClosed           = &http.ProtocolError{ErrorString: "connection closed by user"}
+	ErrPipeline         = &http.ProtocolError{ErrorString: "pipeline error"}
+	ErrBodyWaitingRead  = &http.ProtocolError{ErrorString: "body data waiting for read"}
+	ErrBodyLeftData     = errors.New("http: some data left in the buffer")
+	ErrServerClosedConn = errors.New("http: server closed connection")
 )
 
 var errClosed = errors.New("i/o operation on closed connection")
 
 type ClientConn struct {
-	mu              sync.Mutex // read-write protects the following fields
-	c               net.Conn
-	r               *bufio.Reader
-	bodyReading     bool
-	re, we          error // read/write errors
-	nread, nwritten int
-	reqch           chan *http.Request
-	respch          chan *http.Response
-	writeReq        func(*http.Request, io.Writer) error
+	mu          sync.Mutex // read-write protects the following fields
+	conn        net.Conn
+	r           *bufio.Reader
+	bodyReading bool
+	re, we      error // read/write errors
+	reqch       chan *http.Request
+	respch      chan *http.Response
+	closech     chan struct{}
+	writeReq    func(*http.Request, io.Writer) error
 }
 
 func NewClientConn(c net.Conn, r *bufio.Reader) *ClientConn {
@@ -38,7 +37,7 @@ func NewClientConn(c net.Conn, r *bufio.Reader) *ClientConn {
 		r = bufio.NewReader(c)
 	}
 	cc := &ClientConn{
-		c:        c,
+		conn:     c,
 		r:        r,
 		reqch:    make(chan *http.Request, 1),
 		respch:   make(chan *http.Response, 1),
@@ -67,6 +66,7 @@ func (cc *ClientConn) waitForBody() bool {
 	defer cc.mu.Unlock()
 	return cc.bodyReading
 }
+
 func (cc *ClientConn) write(req *http.Request) error {
 	var err error
 	if err = cc.Ping(); err != nil {
@@ -76,7 +76,7 @@ func (cc *ClientConn) write(req *http.Request) error {
 		return ErrBodyWaitingRead
 	}
 	cc.mu.Lock()
-	c := cc.c
+	c := cc.conn
 	if req.Close {
 		cc.we = ErrPersistEOF
 	}
@@ -88,23 +88,28 @@ func (cc *ClientConn) write(req *http.Request) error {
 		cc.mu.Unlock()
 		return err
 	}
-	cc.nwritten++
 	cc.mu.Unlock()
 	cc.reqch <- req
 	return nil
 }
 
 func (cc *ClientConn) read(req *http.Request) (resp *http.Response, err error) {
-	resp = <-cc.respch
+	ctx := req.Context()
+	select {
+	case resp = <-cc.respch:
+	case <-ctx.Done():
+		err = ctx.Err()
+		cc.setReadError(err)
+	}
 	return
 }
 
 func (cc *ClientConn) Hijack() (c net.Conn, r *bufio.Reader) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-	c = cc.c
+	c = cc.conn
 	r = cc.r
-	cc.c = nil
+	cc.conn = nil
 	cc.r = nil
 	return
 }
@@ -114,6 +119,7 @@ func (cc *ClientConn) Close() error {
 	if c != nil {
 		return c.Close()
 	}
+	close(cc.closech)
 	return nil
 }
 
@@ -126,10 +132,16 @@ func (cc *ClientConn) Ping() error {
 	if cc.we != nil {
 		return cc.we
 	}
-	if cc.c == nil { // connection closed by user in the meantime
+	if cc.conn == nil { // connection closed by user in the meantime
 		return errClosed
 	}
 	return nil
+}
+
+func (cc *ClientConn) setReadError(err error) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.re = err
 }
 
 func (cc *ClientConn) readLoop() {
@@ -137,20 +149,19 @@ func (cc *ClientConn) readLoop() {
 	for alive {
 		_, err := cc.r.Peek(1)
 		if err != nil {
-			cc.re = err
+			cc.setReadError(ErrServerClosedConn)
 			break
 		}
 		rc := <-cc.reqch
 		resp, err := http.ReadResponse(cc.r, rc)
 		if err != nil {
-			cc.mu.Lock()
-			cc.re = err
-			cc.mu.Unlock()
+			cc.setReadError(err)
 			break
 		}
 		hasBody := rc.Method != "HEAD" && resp.ContentLength != 0
 		if resp.Close || rc.Close || resp.StatusCode <= 199 {
 			alive = false
+			cc.setReadError(ErrServerClosedConn)
 		}
 		if !hasBody {
 			continue
@@ -161,25 +172,30 @@ func (cc *ClientConn) readLoop() {
 			earlyCloseFn: func() error {
 				waitForBodyRead <- false
 				return nil
-
 			},
 			fn: func(err error) error {
-				isEOF := err == io.EOF
-				waitForBodyRead <- isEOF
+				waitForBodyRead <- (err == io.EOF)
 				return err
 			},
 		}
 		resp.Body = body
 		cc.respch <- resp
-		cc.mu.Lock()
-		cc.bodyReading = true
-		cc.mu.Unlock()
+		cc.setBodyReading(true)
 		select {
 		case bodyEOF := <-waitForBodyRead:
-			_ = bodyEOF
+			alive = alive && bodyEOF
+			if !bodyEOF {
+				cc.setReadError(ErrBodyLeftData)
+			}
+		case <-cc.closech:
+			alive = false
 		}
-		cc.mu.Lock()
-		cc.bodyReading = false
-		cc.mu.Unlock()
+		cc.setBodyReading(false)
 	}
+}
+
+func (cc *ClientConn) setBodyReading(flag bool) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.bodyReading = flag
 }
