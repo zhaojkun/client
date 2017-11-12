@@ -150,13 +150,18 @@ func (cc *ClientConn) setReadError(err error) {
 func (cc *ClientConn) readLoop() {
 	alive := true
 	for alive {
-		_, err := cc.r.Peek(1)
+		r := cc.getReader()
+		if r == nil {
+			alive = false
+			break
+		}
+		_, err := r.Peek(1)
 		if err != nil {
 			cc.setReadError(ErrServerClosedConn)
 			break
 		}
 		rc := <-cc.reqch
-		resp, err := http.ReadResponse(cc.r, rc)
+		resp, err := http.ReadResponse(r, rc)
 		if err != nil {
 			cc.setReadError(err)
 			break
@@ -193,6 +198,11 @@ func (cc *ClientConn) readLoop() {
 	cc.stoped = true
 }
 
+func (cc *ClientConn) getReader() *bufio.Reader {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.r
+}
 func (cc *ClientConn) setBodyReading(flag bool) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
