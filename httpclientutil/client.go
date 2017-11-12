@@ -25,6 +25,7 @@ type ClientConn struct {
 	conn        net.Conn
 	r           *bufio.Reader
 	bodyReading bool
+	stoped      bool
 	re, we      error // read/write errors
 	reqch       chan *http.Request
 	respch      chan *http.Response
@@ -60,8 +61,7 @@ func (cc *ClientConn) Do(req *http.Request) (*http.Response, error) {
 	}
 	return cc.read(req)
 }
-
-func (cc *ClientConn) waitForBody() bool {
+func (cc *ClientConn) iswaiting() bool {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	return cc.bodyReading
@@ -72,7 +72,7 @@ func (cc *ClientConn) write(req *http.Request) error {
 	if err = cc.Ping(); err != nil {
 		return err
 	}
-	if cc.waitForBody() {
+	if cc.iswaiting() {
 		return ErrBodyWaitingRead
 	}
 	cc.mu.Lock()
@@ -135,6 +135,9 @@ func (cc *ClientConn) Ping() error {
 	if cc.conn == nil { // connection closed by user in the meantime
 		return errClosed
 	}
+	if cc.stoped {
+		return errClosed
+	}
 	return nil
 }
 
@@ -167,18 +170,7 @@ func (cc *ClientConn) readLoop() {
 			continue
 		}
 		waitForBodyRead := make(chan bool, 2)
-		body := &bodyEOFSignal{
-			body: resp.Body,
-			earlyCloseFn: func() error {
-				waitForBodyRead <- false
-				return nil
-			},
-			fn: func(err error) error {
-				waitForBodyRead <- (err == io.EOF)
-				return err
-			},
-		}
-		resp.Body = body
+		resp.Body = newBodyEOFSingle(resp.Body, waitForBodyRead)
 		cc.respch <- resp
 		cc.setBodyReading(true)
 		select {
@@ -187,11 +179,18 @@ func (cc *ClientConn) readLoop() {
 			if !bodyEOF {
 				cc.setReadError(ErrBodyLeftData)
 			}
+		case <-rc.Cancel:
+			alive = false
+		case <-rc.Context().Done():
+			alive = false
 		case <-cc.closech:
 			alive = false
 		}
 		cc.setBodyReading(false)
 	}
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.stoped = true
 }
 
 func (cc *ClientConn) setBodyReading(flag bool) {

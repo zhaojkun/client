@@ -26,6 +26,20 @@ type bodyEOFSignal struct {
 	earlyCloseFn func() error      // optional alt Close func used if io.EOF not seen
 }
 
+func newBodyEOFSingle(body io.ReadCloser, waitch chan bool) io.ReadCloser {
+	return &bodyEOFSignal{
+		body: body,
+		earlyCloseFn: func() error {
+			waitch <- false
+			return nil
+		},
+		fn: func(err error) error {
+			waitch <- (err == io.EOF)
+			return err
+		},
+	}
+}
+
 var errReadOnClosedResBody = errors.New("http: read on closed response body")
 
 func (es *bodyEOFSignal) Read(p []byte) (n int, err error) {
