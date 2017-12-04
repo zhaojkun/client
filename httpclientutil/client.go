@@ -176,9 +176,11 @@ func (cc *ClientConn) readLoop() {
 		}
 		waitForBodyRead := make(chan bool, 2)
 		resp.Body = newBodyEOFSingle(resp.Body, waitForBodyRead, func(err error) {
-			defer cc.setBodyReading(false)
+			cc.mu.Lock()
+			defer cc.mu.Unlock()
+			cc.bodyReading = false
 			if err != nil && err != io.EOF {
-				cc.setReadError(ErrBodyLeftData)
+				cc.re = ErrBodyLeftData
 			}
 		})
 		cc.respch <- resp
