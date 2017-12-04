@@ -175,15 +175,17 @@ func (cc *ClientConn) readLoop() {
 			continue
 		}
 		waitForBodyRead := make(chan bool, 2)
-		resp.Body = newBodyEOFSingle(resp.Body, waitForBodyRead)
+		resp.Body = newBodyEOFSingle(resp.Body, waitForBodyRead, func(err error) {
+			defer cc.setBodyReading(false)
+			if err != nil && err != io.EOF {
+				cc.setReadError(ErrBodyLeftData)
+			}
+		})
 		cc.respch <- resp
 		cc.setBodyReading(true)
 		select {
 		case bodyEOF := <-waitForBodyRead:
 			alive = alive && bodyEOF
-			if !bodyEOF {
-				cc.setReadError(ErrBodyLeftData)
-			}
 		case <-rc.Cancel:
 			alive = false
 		case <-rc.Context().Done():
