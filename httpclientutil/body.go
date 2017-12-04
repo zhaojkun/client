@@ -26,7 +26,7 @@ type bodyEOFSignal struct {
 	earlyCloseFn func() error      // optional alt Close func used if io.EOF not seen
 }
 
-func newBodyEOFSingle(body io.ReadCloser, waitch chan bool) io.ReadCloser {
+func newBodyEOFSingle(body io.ReadCloser, waitch chan bool, closeFn func(error)) io.ReadCloser {
 	return &bodyEOFSignal{
 		body: body,
 		earlyCloseFn: func() error {
@@ -34,6 +34,9 @@ func newBodyEOFSingle(body io.ReadCloser, waitch chan bool) io.ReadCloser {
 			return nil
 		},
 		fn: func(err error) error {
+			if closeFn != nil {
+				closeFn(err)
+			}
 			waitch <- (err == io.EOF)
 			return err
 		},
