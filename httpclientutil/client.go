@@ -43,6 +43,7 @@ func NewClientConn(c net.Conn, r *bufio.Reader) *ClientConn {
 		reqch:    make(chan *http.Request, 1),
 		respch:   make(chan *http.Response, 1),
 		writeReq: (*http.Request).Write,
+		closech:  make(chan struct{}),
 	}
 	go cc.readLoop()
 	return cc
